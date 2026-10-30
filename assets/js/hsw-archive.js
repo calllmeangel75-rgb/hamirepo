@@ -1,0 +1,721 @@
+/**
+ * HamiShop Elementor Widgets — Archive frontend behavior (v1.9.0).
+ * Vanilla JS, no dependencies, event delegation only.
+ *
+ * Sheets/modals, SEO description toggle, filter box collapse, in-list search,
+ * price slider sync, chips/swatches → one hidden input per taxonomy,
+ * desktop auto-submit (with a no-JS submit fallback), checkbox mirroring
+ * between the desktop sidebar and the mobile sheet, add-to-cart, wishlist.
+ */
+(function () {
+        'use strict';
+
+        /* Marks the document as JS-capable so no-JS fallbacks can hide. */
+        document.documentElement.classList.add('hsw-js');
+
+        var FA = { '0': '۰', '1': '۱', '2': '۲', '3': '۳', '4': '۴', '5': '۵', '6': '۶', '7': '۷', '8': '۸', '9': '۹' };
+        function fa(n) { return String(n).replace(/[0-9]/g, function (d) { return FA[d]; }); }
+        function fmt(n) { return fa(Number(n).toLocaleString('en-US').replace(/,/g, ',')); }
+
+        /* ======================= SHEETS & MODALS ======================= */
+
+        var lastFocus = null;
+
+        function openSheet(name) {
+                var el = document.querySelector('[data-hsw-sheet="' + name + '"]');
+                if (!el) { return; }
+                lastFocus = document.activeElement;
+                el.classList.add('is-open');
+                el.setAttribute('aria-hidden', 'false');
+                document.body.classList.add('hsw-noscroll');
+                var first = el.querySelector('button, a, input, [tabindex]');
+                if (first) { first.focus({ preventScroll: true }); }
+        }
+
+        function closeSheet(sheet) {
+                if (!sheet) { return; }
+                sheet.classList.remove('is-open');
+                sheet.setAttribute('aria-hidden', 'true');
+                if (!document.querySelector('.hsw-asheet.is-open, .hsw-agd__modal.is-open')) {
+                        document.body.classList.remove('hsw-noscroll');
+                }
+                if (lastFocus && typeof lastFocus.focus === 'function') {
+                        lastFocus.focus({ preventScroll: true });
+                        lastFocus = null;
+                }
+        }
+
+        document.addEventListener('click', function (e) {
+                var opener = e.target.closest('[data-hsw-open]');
+                if (opener) {
+                        e.preventDefault();
+                        openSheet(opener.getAttribute('data-hsw-open'));
+                        return;
+                }
+                var closer = e.target.closest('[data-hsw-close]');
+                if (closer) {
+                        e.preventDefault();
+                        closeSheet(closer.closest('.hsw-asheet, .hsw-agd__modal'));
+                }
+        });
+
+        document.addEventListener('keydown', function (e) {
+                if ('Escape' !== e.key) { return; }
+                document.querySelectorAll('.hsw-asheet.is-open, .hsw-agd__modal.is-open').forEach(closeSheet);
+        });
+
+        /* ======================= FILTER RESET («حذف همه») ======================= */
+
+        /*
+         * The link already points at the unfiltered archive URL, but a page
+         * cache can hand back the filtered document for it. Clearing the form
+         * first means the next render starts from a clean state, and the
+         * explicit navigation ignores any stale href the browser restored from
+         * the bfcache.
+         */
+        document.addEventListener('click', function (e) {
+                var reset = e.target.closest('[data-hsw-reset]');
+                if (!reset) { return; }
+                e.preventDefault();
+
+                var form = reset.closest('.hsw-af__form');
+                if (form) {
+                        form.querySelectorAll('input[type="checkbox"]').forEach(function (cb) { cb.checked = false; });
+                        form.querySelectorAll('[data-hsw-taxinput]').forEach(function (inp) { inp.value = ''; });
+                        form.querySelectorAll('[data-hsw-tax].is-active').forEach(function (el) { el.classList.remove('is-active'); });
+                }
+
+                var url = reset.getAttribute('href') || reset.getAttribute('data-hsw-reset-url');
+                if (url) {
+                        window.location.assign(url);
+                }
+        });
+
+        /* ======================= SEO DESCRIPTION TOGGLE ======================= */
+
+        document.addEventListener('click', function (e) {
+                var btn = e.target.closest('[data-hsw-seo]');
+                if (!btn) { return; }
+                var box = btn.parentElement;
+                var target = box ? box.querySelector('[data-hsw-seo-target]') : null;
+                if (!target) { return; }
+                var open = target.classList.toggle('is-open');
+                target.classList.toggle('is-clamped', !open);
+                var label = btn.querySelector('span');
+                if (label) {
+                        var closeTxt = btn.getAttribute('data-hsw-close-txt') || 'بستن';
+                        if (!btn.hasAttribute('data-hsw-label')) {
+                                btn.setAttribute('data-hsw-label', label.textContent);
+                        }
+                        label.textContent = open ? closeTxt : btn.getAttribute('data-hsw-label');
+                }
+                btn.classList.toggle('is-open', open);
+                btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        });
+
+        /* ======================= FILTER BOX COLLAPSE ======================= */
+
+        document.addEventListener('click', function (e) {
+                var head = e.target.closest('.hsw-af__boxhead');
+                if (!head) { return; }
+                var box = head.closest('[data-hsw-collapse]');
+                if (!box) { return; }
+                var collapsed = box.classList.toggle('is-collapsed');
+                head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+        });
+
+        /* ======================= CATEGORY TREE ======================= */
+
+        function setCatNodeOpen(li, open) {
+                if (!li) { return; }
+                var branch = li.querySelector('[data-hsw-catbranch]');
+                var toggle = li.querySelector('[data-hsw-cattoggle]');
+                li.classList.toggle('is-open', open);
+                if (branch) { branch.hidden = !open; }
+                if (toggle) { toggle.setAttribute('aria-expanded', open ? 'true' : 'false'); }
+        }
+
+        function filterCatTree(input) {
+                var box = input.closest('.hsw-af__box');
+                var tree = box ? box.querySelector('[data-hsw-cattree]') : null;
+                if (!tree) { return; }
+                var empty = box.querySelector('[data-hsw-catempty]');
+                var q = input.value.trim().toLowerCase();
+                var nodes = tree.querySelectorAll('.hsw-af__catnode');
+                var links = tree.querySelectorAll('[data-hsw-catname]');
+                var showAll = tree.getAttribute('data-hsw-showall') === '1';
+
+                if (!q) {
+                        nodes.forEach(function (node) {
+                                node.hidden = false;
+                                node.classList.remove('is-search-hit');
+                        });
+                        if (!showAll) {
+                                tree.querySelectorAll('.hsw-af__catnode.is-extra').forEach(function (node) {
+                                        node.hidden = true;
+                                });
+                        }
+                        nodes.forEach(function (node) {
+                                var branch = node.querySelector('[data-hsw-catbranch]');
+                                if (branch) { branch.hidden = !node.classList.contains('is-open'); }
+                        });
+                        if (empty) { empty.hidden = true; }
+                        return;
+                }
+
+                nodes.forEach(function (node) {
+                        node.hidden = true;
+                        node.classList.remove('is-search-hit');
+                });
+
+                var hits = 0;
+                links.forEach(function (link) {
+                        var name = link.getAttribute('data-hsw-catname') || '';
+                        if (-1 === name.indexOf(q)) { return; }
+                        hits++;
+                        var li = link.closest('.hsw-af__catnode');
+                        while (li) {
+                                li.hidden = false;
+                                li.classList.add('is-search-hit');
+                                var parentUl = li.parentElement;
+                                if (!parentUl || !parentUl.hasAttribute('data-hsw-catbranch')) {
+                                        li = null;
+                                        continue;
+                                }
+                                parentUl.hidden = false;
+                                var parentLi = parentUl.parentElement ? parentUl.parentElement.closest('.hsw-af__catnode') : null;
+                                setCatNodeOpen(parentLi, true);
+                                li = parentLi;
+                        }
+                });
+
+                if (empty) { empty.hidden = hits > 0; }
+        }
+
+        document.addEventListener('click', function (e) {
+                var toggle = e.target.closest('[data-hsw-cattoggle]');
+                if (toggle) {
+                        var node = toggle.closest('.hsw-af__catnode');
+                        if (node) {
+                                setCatNodeOpen(node, !node.classList.contains('is-open'));
+                        }
+                        return;
+                }
+                var more = e.target.closest('[data-hsw-catmore]');
+                if (!more) { return; }
+                var box = more.closest('.hsw-af__box');
+                var tree = box ? box.querySelector('[data-hsw-cattree]') : null;
+                if (!tree) { return; }
+                tree.querySelectorAll('.hsw-af__catnode.is-extra').forEach(function (extra) {
+                        extra.hidden = false;
+                });
+                tree.setAttribute('data-hsw-showall', '1');
+                more.hidden = true;
+        });
+
+        document.addEventListener('input', function (e) {
+                var catInput = e.target.closest('[data-hsw-catsearch]');
+                if (catInput) {
+                        filterCatTree(catInput);
+                }
+        });
+
+        /* ======================= IN-LIST SEARCH ======================= */
+
+        document.addEventListener('input', function (e) {
+                if (e.target.closest('[data-hsw-catsearch]')) { return; }
+                var input = e.target.closest('[data-hsw-search]');
+                if (!input) { return; }
+                var box = input.closest('.hsw-af__box');
+                var list = box ? box.querySelector('[data-hsw-termlist]') : null;
+                if (!list) { return; }
+                var q = input.value.trim().toLowerCase();
+                list.querySelectorAll('.hsw-af__checkrow').forEach(function (row) {
+                        var name = (row.textContent || '').trim().toLowerCase();
+                        row.style.display = (!q || -1 !== name.indexOf(q)) ? '' : 'none';
+                });
+        });
+
+        /* ======================= PRICE SLIDER ======================= */
+
+        /*
+         * Price filter — two handles.
+         *
+         * Everything is scoped to the visible container (.hsw-af__side on
+         * desktop, .hsw-asheet--filter on mobile): the form holds BOTH copies,
+         * so a form-wide querySelector used to move the desktop handle while the
+         * user dragged the mobile one.
+         */
+        function priceScope(el) {
+                return el.closest('.hsw-af__side') || el.closest('.hsw-asheet--filter') || el.closest('.hsw-af__form');
+        }
+
+        function priceParts(scope) {
+                if (!scope) { return null; }
+                var minR = scope.querySelector('[data-hsw-priceminrange]');
+                var maxR = scope.querySelector('[data-hsw-pricemax]');
+                var minN = scope.querySelector('[data-hsw-pricemin]');
+                var maxN = scope.querySelector('[data-hsw-pricemaxinput]');
+                var fill = scope.querySelector('[data-hsw-pricefill]');
+                if (!minR || !maxR) { return null; }
+                return { minR: minR, maxR: maxR, minN: minN, maxN: maxN, fill: fill };
+        }
+
+        function paintPrice(p) {
+                var lo = Number(p.minR.min);
+                var hi = Number(p.maxR.max);
+                var span = hi - lo || 1;
+
+                /* 0..1 measured from the low end. */
+                var from = Math.min(1, Math.max(0, (Number(p.minR.value) - lo) / span));
+                var to = Math.min(1, Math.max(0, (Number(p.maxR.value) - lo) / span));
+
+                var wrap = p.minR.parentNode;
+                var rtl = wrap && 'rtl' === window.getComputedStyle(wrap).direction;
+
+                /*
+                 * Physical left/right, flipped for RTL. Logical properties were
+                 * unreliable here: the fill sits in its own formatting context, so
+                 * `inset-inline-start` resolved the wrong way and the filled band
+                 * appeared on the wrong side of the track.
+                 */
+                if (p.fill) {
+                        p.fill.style.left = (rtl ? (1 - to) * 100 : from * 100) + '%';
+                        p.fill.style.right = (rtl ? from * 100 : (1 - to) * 100) + '%';
+                }
+                if (wrap) { wrap.classList.toggle('is-min-active', Number(p.minR.value) > lo); }
+        }
+
+        /* Numbers mirror the handles; an empty field means "no bound". */
+        function syncNumbers(p) {
+                var lo = Number(p.minR.min);
+                var hi = Number(p.maxR.max);
+                if (p.minN) { p.minN.value = Number(p.minR.value) > lo ? p.minR.value : ''; }
+                if (p.maxN) { p.maxN.value = Number(p.maxR.value) < hi ? p.maxR.value : ''; }
+        }
+
+        function clampPrice(p, from) {
+                var lo = Number(p.minR.min);
+                var hi = Number(p.maxR.max);
+                var a = Math.min(Math.max(Number(p.minR.value) || lo, lo), hi);
+                var b = Math.min(Math.max(Number(p.maxR.value) || hi, lo), hi);
+                if (a > b) {
+                        if (from === 'min') { b = a; } else { a = b; }
+                }
+                p.minR.value = a;
+                p.maxR.value = b;
+                paintPrice(p);
+        }
+
+        document.addEventListener('input', function (e) {
+                var el = e.target;
+                if (!el.matches('[data-hsw-priceminrange], [data-hsw-pricemax], [data-hsw-pricemin], [data-hsw-pricemaxinput]')) {
+                        return;
+                }
+                var p = priceParts(priceScope(el));
+                if (!p) { return; }
+
+                if (el.matches('[data-hsw-priceminrange]')) {
+                        clampPrice(p, 'min');
+                        syncNumbers(p);
+                        queueAutoSubmit(el);
+                        return;
+                }
+                if (el.matches('[data-hsw-pricemax]')) {
+                        clampPrice(p, 'max');
+                        syncNumbers(p);
+                        queueAutoSubmit(el);
+                        return;
+                }
+                /*
+                 * Typed numbers: correct the field the user is editing, never the
+                 * other one. Typing 95000 while the minimum sits at 200000 used
+                 * to drag the minimum down; now the typed value is clamped into
+                 * [other bound, catalog bound] and written back only when it had
+                 * to change, so the caret is left alone while typing normally.
+                 */
+                var lo = Number(p.minR.min);
+                var hi = Number(p.maxR.max);
+                var raw = String(el.value).trim();
+                var num = parseFloat(raw.replace(/[^0-9.]/g, ''));
+
+                if ('' === raw || isNaN(num)) {
+                        if (el === p.minN) { p.minR.value = lo; } else { p.maxR.value = hi; }
+                } else if (el === p.minN) {
+                        var capped = Math.min(Math.max(num, lo), Number(p.maxR.value));
+                        p.minR.value = capped;
+                        if (String(capped) !== raw) { el.value = capped > lo ? String(capped) : ''; }
+                } else {
+                        var floored = Math.max(Math.min(num, hi), Number(p.minR.value));
+                        p.maxR.value = floored;
+                        if (String(floored) !== raw) { el.value = floored < hi ? String(floored) : ''; }
+                }
+
+                paintPrice(p);
+                if (el !== p.minN && p.minN) { p.minN.value = Number(p.minR.value) > lo ? p.minR.value : ''; }
+                if (el !== p.maxN && p.maxN) { p.maxN.value = Number(p.maxR.value) < hi ? p.maxR.value : ''; }
+        });
+
+        document.addEventListener('change', function (e) {
+                if (e.target.matches('[data-hsw-pricemin], [data-hsw-pricemaxinput]')) {
+                        queueAutoSubmit(e.target);
+                }
+        });
+
+        /* Paint every price box once so the fill matches the server state. */
+        Array.prototype.forEach.call(document.querySelectorAll('[data-hsw-pricerange]'), function (box) {
+                var p = priceParts(box.parentNode);
+                if (p) { paintPrice(p); }
+        });
+
+        /* ======================= CHIPS / SWATCHES → HIDDEN INPUT ======================= */
+
+        function taxInput(form, tax) {
+                return form.querySelector('[data-hsw-taxinput="' + tax + '"]');
+        }
+
+        function paintChips(form, tax, slugs) {
+                form.querySelectorAll('[data-hsw-tax="' + tax + '"]').forEach(function (el) {
+                        el.classList.toggle('is-active', -1 !== slugs.indexOf(el.getAttribute('data-hsw-value')));
+                });
+        }
+
+        document.addEventListener('click', function (e) {
+                var chip = e.target.closest('[data-hsw-tax][data-hsw-value]');
+                if (!chip) { return; }
+                var form = chip.closest('.hsw-af__form');
+                if (!form) { return; }
+                var tax = chip.getAttribute('data-hsw-tax');
+                var value = chip.getAttribute('data-hsw-value');
+                var input = taxInput(form, tax);
+                if (!input) { return; }
+                var slugs = input.value ? input.value.split(',').filter(Boolean) : [];
+                var i = slugs.indexOf(value);
+                if (-1 === i) { slugs.push(value); } else { slugs.splice(i, 1); }
+                input.value = slugs.join(',');
+                paintChips(form, tax, slugs);
+                if (!chip.closest('.hsw-asheet')) { queueAutoSubmit(chip); }
+        });
+
+        /* ======================= CHECKBOX MIRRORING ======================= */
+
+        function mirror(form, cb) {
+                var name = cb.getAttribute('name');
+                var value = cb.getAttribute('value');
+                if (!name) { return; }
+                form.querySelectorAll('input[type="checkbox"][name="' + name + '"][value="' + value + '"]').forEach(function (other) {
+                        if (other !== cb) { other.checked = cb.checked; }
+                });
+        }
+
+        /* ======================= AUTO-SUBMIT (desktop) ======================= */
+
+        var autoTimer = null;
+        var autoForm = null;
+
+        function queueAutoSubmit(el) {
+                if (el.closest('.hsw-asheet')) { return; }
+                var form = el.closest('.hsw-af__form');
+                if (!form) { return; }
+                autoForm = form;
+                if (autoTimer) { clearTimeout(autoTimer); }
+                autoTimer = setTimeout(function () {
+                        if (!autoForm) { return; }
+                        var f = autoForm;
+                        autoForm = null;
+                        submitForm(f);
+                }, 650);
+        }
+
+        /*
+         * The filter form carries TWO copies of every field: the desktop sidebar
+         * and the mobile sheet. Both are inside the same <form>, so the browser
+         * submitted each name twice and PHP kept the LAST one — always the sheet
+         * copy. Changing a desktop control left the sheet copy stale, so the
+         * stale value won and the filter looked broken (price above all).
+         * Disabling the copy that is not visible keeps exactly one value.
+         */
+        function pruneHiddenCopy(form) {
+                ['.hsw-af__side', '.hsw-asheet--filter'].forEach(function (sel) {
+                        var box = form.querySelector(sel);
+                        if (!box) { return; }
+                        var cs = window.getComputedStyle(box);
+                        var visible = cs.display !== 'none' && cs.visibility !== 'hidden' && box.getClientRects().length > 0;
+                        if (visible) {
+                                box.removeAttribute('data-hsw-pruned');
+                                return;
+                        }
+                        /*
+                         * Mark the copy, not just its fields: the later passes in
+                         * this file re-enable every checked checkbox, which undid
+                         * this pruning and submitted each name twice (the desktop
+                         * value and the stale sheet value).
+                         */
+                        box.setAttribute('data-hsw-pruned', '1');
+                        box.querySelectorAll('input, select, textarea').forEach(function (el) {
+                                if (!el.disabled) {
+                                        el.disabled = true;
+                                        el.setAttribute('data-hsw-was-enabled', '1');
+                                }
+                        });
+                });
+        }
+
+        /* A pruned copy must stay out of every later pass. */
+        function isPruned(el) {
+                return !!(el.closest && el.closest('[data-hsw-pruned]'));
+        }
+
+        document.addEventListener('submit', function (e) {
+                if (e.target && e.target.classList && e.target.classList.contains('hsw-af__form')) {
+                        pruneHiddenCopy(e.target);
+                }
+        }, true);
+
+        function submitForm(form) {
+                pruneHiddenCopy(form);
+                if (form.requestSubmit) {
+                        form.requestSubmit();
+                } else {
+                        form.submit();
+                }
+        }
+
+        document.addEventListener('change', function (e) {
+                var cb = e.target.closest('.hsw-af__check, .hsw-af__switchinput');
+                if (!cb) { return; }
+                var form = cb.closest('.hsw-af__form');
+                if (form) { mirror(form, cb); }
+                if (!cb.closest('.hsw-asheet')) { queueAutoSubmit(cb); }
+        });
+
+        /* ======================= SUBMIT: drop empty params ======================= */
+
+        document.addEventListener('submit', function (e) {
+                var form = e.target.closest('.hsw-af__form');
+                if (!form) { return; }
+                if (autoTimer) { clearTimeout(autoTimer); }
+
+                /* Price fields equal to the slider bounds are not a filter. */
+                var range = form.querySelector('[data-hsw-pricemax]');
+                if (range) {
+                        var rmin = Number(range.min);
+                        var rmax = Number(range.max);
+                        form.querySelectorAll('input[name="min_price"]').forEach(function (inp) {
+                                if ('' === String(inp.value).trim() || Number(inp.value) <= rmin) { inp.value = ''; }
+                        });
+                        form.querySelectorAll('input[name="max_price"]').forEach(function (inp) {
+                                if ('' === String(inp.value).trim() || Number(inp.value) >= rmax) { inp.value = ''; }
+                        });
+                }
+
+                /* Duplicate checkbox names → single CSV field (WooCommerce contract). */
+                var groups = {};
+                form.querySelectorAll('input[type="checkbox"][name^="filter_"]').forEach(function (cb) {
+                        if (isPruned(cb)) { return; }
+                        var name = cb.getAttribute('name');
+                        if (!groups[name]) { groups[name] = []; }
+                        if (cb.checked && -1 === groups[name].indexOf(cb.value)) { groups[name].push(cb.value); }
+                });
+                Object.keys(groups).forEach(function (name) {
+                        form.querySelectorAll('input[type="checkbox"][name="' + name.replace(/"/g, '\\"') + '"]').forEach(function (cb) {
+                                if (isPruned(cb)) { return; }
+                                cb.disabled = true;
+                        });
+                        if (!groups[name].length) { return; }
+                        var hidden = document.createElement('input');
+                        hidden.type = 'hidden';
+                        hidden.name = name.replace(/\[\]$/, '');
+                        hidden.value = groups[name].join(',');
+                        form.appendChild(hidden);
+                });
+
+                form.querySelectorAll('input[type="checkbox"]').forEach(function (cb) {
+                        /* Re-enabling a checked box inside the pruned (hidden)
+                           copy submitted the same name twice and let the stale
+                           copy win — the filter then looked broken. */
+                        if (isPruned(cb)) { return; }
+                        cb.disabled = !cb.checked;
+                });
+                form.querySelectorAll('input[type="number"], input[type="range"], input[type="hidden"]').forEach(function (inp) {
+                        if ('' === String(inp.value).trim()) { inp.disabled = true; }
+                });
+                var sheet = form.querySelector('.hsw-asheet.is-open');
+                if (sheet) { closeSheet(sheet); }
+        });
+
+        /* ======================= STORE INPUTS (template → form) ======================= */
+
+        function initStore() {
+                document.querySelectorAll('.hsw-af__form template[data-hsw-store]').forEach(function (tpl) {
+                        var form = tpl.parentElement;
+                        if (!form) { return; }
+                        var wrap = document.createElement('div');
+                        wrap.className = 'hsw-af__store';
+                        wrap.hidden = true;
+                        wrap.innerHTML = tpl.innerHTML;
+                        form.insertBefore(wrap, form.firstChild);
+                        tpl.remove();
+                });
+        }
+        if ('loading' !== document.readyState) { initStore(); } else { document.addEventListener('DOMContentLoaded', initStore); }
+
+        /* ======================= ADD TO CART (AJAX) ======================= */
+
+        /*
+         * Feedback is owned by the shared module (assets/js/hsw-feedback.js),
+         * which guarantees the toast and the cart modal never both appear.
+         */
+        function toast(msg, tone) {
+                if (window.HSWFeedback) {
+                        window.HSWFeedback.toast(msg, { tone: tone });
+                }
+        }
+
+        function resetBtn(btn) {
+                btn.classList.remove('is-added', 'is-busy');
+                btn.style.pointerEvents = '';
+                var ic = btn.querySelector('.hsw-ic');
+                if (ic) { window.hswSetIcon(ic, btn.classList.contains('hsw-ag__cta--m') ? 'add' : 'add_shopping_cart'); }
+        }
+
+        function addToCart(btn) {
+                var pid = parseInt(btn.getAttribute('data-hsw-add'), 10) || 0;
+                if (!pid || btn.classList.contains('is-busy')) { return; }
+                var data = (window.hswArchiveData || {});
+                var endpoint = data.wcAjax || '/?wc-ajax=add_to_cart';
+                btn.classList.add('is-busy');
+                btn.style.pointerEvents = 'none';
+                var body = new URLSearchParams();
+                body.set('product_id', String(pid));
+                body.set('quantity', '1');
+                fetch(endpoint, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+                        body: body.toString()
+                }).then(function (r) {
+                        return r.json();
+                }).then(function (res) {
+                        /*
+                         * Variable products (and anything that cannot be added
+                         * from a listing) come back as {error:true, product_url}.
+                         * The old handler threw the response away, so the button
+                         * flashed a tick and nothing else happened — the customer
+                         * had to work out on their own that they needed the
+                         * product page.
+                         */
+                        if (res && res.error && res.product_url) {
+                                window.location.href = res.product_url;
+                                return;
+                        }
+                        if (res && res.error) {
+                                resetBtn(btn);
+                                toast(data.errorText || 'افزودن به سبد خرید ممکن نشد.', 'error');
+                                return;
+                        }
+
+                        btn.classList.add('is-added');
+                        var ic = btn.querySelector('.hsw-ic');
+                        if (ic) { window.hswSetIcon(ic, 'check_circle'); }
+                        btn.setAttribute('title', data.addedText || '');
+
+                        /*
+                         * The fragments reply already carries the fresh cart
+                         * markup, so reusing it updates the header badge without
+                         * a second round-trip.
+                         */
+                        if (window.jQuery && res && res.fragments) {
+                                window.jQuery(document.body).trigger('added_to_cart', [res.fragments, res.cart_hash]);
+                        } else {
+                                document.dispatchEvent(new CustomEvent('hsw_added_to_cart', { detail: { productId: pid } }));
+                        }
+
+                        if (window.HSWFeedback && data.modal) {
+                                window.HSWFeedback.addedToCart({
+                                        fragments: res && res.fragments,
+                                        cartUrl: data.cartUrl,
+                                        message: data.addedText,
+                                        productName: btn.getAttribute('data-hsw-name') || '',
+                                        style: data.feedbackStyle || 'modal',
+                                        labels: {
+                                                modalTitle: data.modalTitle,
+                                                viewCart: data.viewCart,
+                                                continue: data.continueText,
+                                                close: data.closeText,
+                                                added: data.addedText
+                                        }
+                                });
+                        } else {
+                                toast(data.addedText);
+                        }
+
+                        setTimeout(function () { resetBtn(btn); }, 1800);
+                }).catch(function () {
+                        resetBtn(btn);
+                        toast(data.errorText || 'خطا در ارتباط با سرور.', 'error');
+                });
+        }
+
+        document.addEventListener('click', function (e) {
+                var btn = e.target.closest('[data-hsw-add]');
+                if (!btn) { return; }
+                e.preventDefault();
+                addToCart(btn);
+        });
+
+        /* ======================= WISHLIST ======================= */
+
+        var WISH_KEY = 'hsw_wishlist';
+        function wishList() {
+                try { return JSON.parse(localStorage.getItem(WISH_KEY) || '[]'); } catch (err) { return []; }
+        }
+        function saveWish(list) {
+                try { localStorage.setItem(WISH_KEY, JSON.stringify(list)); } catch (err) { /* storage unavailable */ }
+        }
+        function initWish() {
+                var list = wishList();
+                document.querySelectorAll('[data-hsw-wish]').forEach(function (btn) {
+                        var id = btn.getAttribute('data-hsw-wish');
+                        var on = !!(id && -1 !== list.indexOf(id));
+                        if (on) { btn.classList.add('is-active'); }
+                        if (window.hswFill) { window.hswFill(btn.querySelector('.hsw-ic'), on); }
+                });
+        }
+        document.addEventListener('click', function (e) {
+                var btn = e.target.closest('[data-hsw-wish]');
+                if (!btn) { return; }
+                e.preventDefault();
+                var id = btn.getAttribute('data-hsw-wish');
+                var list = wishList();
+                var i = list.indexOf(id);
+                if (-1 === i) { list.push(id); } else { list.splice(i, 1); }
+                saveWish(list);
+                var on = -1 !== list.indexOf(id);
+                btn.classList.toggle('is-active', on);
+                if (window.hswFill) { window.hswFill(btn.querySelector('.hsw-ic'), on); }
+
+                if (window.HSWFeedback) {
+                        var nm = btn.getAttribute('data-hsw-name') || '';
+                        window.HSWFeedback.toast(
+                                on
+                                        ? (nm ? nm + ' به علاقه‌مندی‌ها اضافه شد' : 'محصول به علاقه‌مندی‌ها اضافه شد')
+                                        : 'از علاقه‌مندی‌ها حذف شد',
+                                { thin: true, duration: 2500, tone: on ? 'ok' : 'error' }
+                        );
+                }
+        });
+        if ('loading' !== document.readyState) { initWish(); } else { document.addEventListener('DOMContentLoaded', initWish); }
+
+        /*
+         * Clearing every filter submits an empty form, and the browser leaves
+         * the bare "shop/?" in the address bar. It filters nothing, so drop it
+         * and keep the canonical archive URL.
+         */
+        function cleanEmptyQuery() {
+                if ('?' === window.location.search) {
+                        window.history.replaceState(null, '', window.location.pathname);
+                }
+        }
+        cleanEmptyQuery();
+})();

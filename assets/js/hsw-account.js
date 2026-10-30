@@ -1,0 +1,1617 @@
+/**
+ * HamiShop account UI - no jQuery, no framework, no external requests.
+ *
+ * Progressive enhancement only: login/register and ticket forms work without
+ * this file. It adds auth tabs, password visibility, membership tabs, the
+ * notification bell behaviour and the local-storage wishlist page.
+ */
+(function () {
+	'use strict';
+
+	var WISH_KEY = 'hsw_wishlist';
+
+	function data() {
+		return window.hswAccountData || {};
+	}
+
+	function faNum(value) {
+		var text = String(value == null ? '' : value);
+		if (!data().faDigits) {
+			return text;
+		}
+		return text.replace(/\d/g, function (digit) {
+			return '۰۱۲۳۴۵۶۷۸۹'.charAt(Number(digit));
+		});
+	}
+
+	function wishList() {
+		try {
+			var value = JSON.parse(localStorage.getItem(WISH_KEY) || '[]');
+			return Array.isArray(value) ? value.map(String) : [];
+		} catch (error) {
+			return [];
+		}
+	}
+
+	function saveWish(list) {
+		try {
+			localStorage.setItem(WISH_KEY, JSON.stringify(list));
+		} catch (error) {
+			/* storage may be disabled */
+		}
+	}
+
+	function updateCounts() {
+		var count = wishList().length;
+		document.querySelectorAll('[data-hsw-wish-count]').forEach(function (badge) {
+			badge.textContent = count ? faNum(count) : '';
+			badge.hidden = !count;
+		});
+	}
+
+	function setHidden(element, hidden) {
+		if (!element) {
+			return;
+		}
+		element.hidden = hidden;
+		element.style.display = hidden ? 'none' : '';
+	}
+
+	function wishlistEmpty(page) {
+		var grid = page.querySelector('[data-hsw-wish-grid]');
+		var empty = page.querySelector('[data-hsw-wish-empty]');
+		var clear = page.querySelector('[data-hsw-wish-clear]');
+		if (grid) {
+			grid.innerHTML = '';
+		}
+		setHidden(empty, false);
+		setHidden(clear, true);
+	}
+
+	function renderWishlist(page) {
+		if (!page || page.getAttribute('data-hsw-ready') === '1') {
+			return;
+		}
+		page.setAttribute('data-hsw-ready', '1');
+
+		var grid = page.querySelector('[data-hsw-wish-grid]');
+		var empty = page.querySelector('[data-hsw-wish-empty]');
+		var clear = page.querySelector('[data-hsw-wish-clear]');
+		var list = wishList();
+
+		updateCounts();
+
+		if (!list.length) {
+			wishlistEmpty(page);
+			return;
+		}
+
+		var rest = data().rest || '/wp-json/hsw/v1';
+		var url = rest.replace(/\/$/, '') + '/account/wishlist?ids=' + encodeURIComponent(list.join(','));
+
+		setHidden(clear, false);
+
+		fetch(url, {
+			credentials: 'same-origin',
+			headers: data().nonce ? { 'X-WP-Nonce': data().nonce } : {}
+		})
+			.then(function (response) {
+				if (!response.ok) {
+					throw new Error('HTTP ' + response.status);
+				}
+				return response.json();
+			})
+			.then(function (payload) {
+				if (!grid) {
+					return;
+				}
+				var valid = payload && Array.isArray(payload.ids) ? payload.ids.map(String) : list;
+				if (valid.length !== list.length) {
+					saveWish(valid);
+				}
+				updateCounts();
+				if (!payload || !payload.html || !valid.length) {
+					wishlistEmpty(page);
+					return;
+				}
+				grid.innerHTML = payload.html;
+				setHidden(empty, true);
+				setHidden(clear, false);
+			})
+			.catch(function () {
+				if (!grid) {
+					return;
+				}
+				grid.innerHTML = '<div class="hsw-ac__empty hsw-ac__empty--inline"><span class="hsw-ac__empty-ic">!</span><h3>' + (data().errorText || 'خطا در بارگذاری علاقه‌مندی‌ها') + '</h3><p>' + (data().retryText || 'اتصال اینترنت را بررسی کنید و صفحه را دوباره باز کنید.') + '</p></div>';
+				setHidden(clear, false);
+			});
+	}
+
+	function init(root) {
+		var scope = root || document;
+		scope.querySelectorAll('[data-hsw-wishlist]').forEach(renderWishlist);
+		scope.querySelectorAll('[data-hsw-verify]').forEach(initEmailVerify);
+		scope.querySelectorAll('[data-hsw-chat]').forEach(initSupportChat);
+		updateCounts();
+	}
+
+	/*
+	 * Support chat: switch conversations without a reload, reply inline, and
+	 * create a ticket from the modal.
+	 *
+	 * The markup is fully server-rendered — every list item is a real link and
+	 * the modal is a real form. This only takes over once it is running.
+	 */
+	function initSupportChat(chat) {
+		if (!chat || '1' === chat.getAttribute('data-hsw-ready')) {
+			return;
+		}
+		chat.setAttribute('data-hsw-ready', '1');
+
+		var main = chat.querySelector('[data-hsw-chat-main]');
+		var list = chat.querySelector('[data-hsw-ticket-list]');
+		var modal = chat.querySelector('[data-hsw-ticket-modal]');
+		var form = chat.querySelector('[data-hsw-ticket-form]');
+		var search = chat.querySelector('[data-hsw-ticket-search]');
+
+		function scrollThread() {
+			var box = chat.querySelector('[data-hsw-thread-scroll]');
+			if (box) {
+				box.scrollTop = box.scrollHeight;
+			}
+		}
+
+		function setRow(row) {
+			if (!row || !list) {
+				return;
+			}
+			var id = row.getAttribute('data-id');
+			var existing = list.querySelector('[data-id="' + id + '"]');
+			if (existing) {
+				existing.outerHTML = row.outerHTML;
+				return;
+			}
+			/* The first ticket replaces the «no conversations» placeholder. */
+			var placeholder = list.querySelector('[data-hsw-chat-placeholder]');
+			if (placeholder) {
+				placeholder.remove();
+			}
+			list.insertAdjacentHTML('afterbegin', row.outerHTML);
+		}
+
+		/* --- conversation switching ------------------------------------- */
+
+		function openTicket(id, push) {
+			chat.setAttribute('data-active', id);
+			main.setAttribute('aria-busy', 'true');
+			ajax('hsw_ticket_view', { ticket_id: id }, data().ticketNonce)
+				.then(function (response) {
+					main.removeAttribute('aria-busy');
+					if (!response || !response.success) {
+						return;
+					}
+					main.innerHTML = response.data.html;
+					if (response.data.row) {
+						setRow(wrapRow(response.data.row, id));
+					}
+					var link = list ? list.querySelector('[data-hsw-ticket="' + id + '"]') : null;
+					if (link) {
+						var item = link.closest('.hsw-ac__chat-item');
+						if (item) {
+							item.classList.remove('is-unread');
+						}
+					}
+					if (push !== false) {
+						history.replaceState({}, '', link ? link.href : location.href);
+					}
+					scrollThread();
+				})
+				.catch(function () {
+					main.removeAttribute('aria-busy');
+				});
+		}
+
+		/* Turn the returned <li> string into an element we can address by id. */
+		function wrapRow(html, id) {
+			var tmp = document.createElement('ul');
+			tmp.innerHTML = html;
+			var li = tmp.firstElementChild;
+			if (li) {
+				li.setAttribute('data-id', id);
+			}
+			return li;
+		}
+
+		if (list) {
+			list.addEventListener('click', function (event) {
+				var link = event.target.closest('[data-hsw-ticket]');
+				if (!link || event.metaKey || event.ctrlKey || event.shiftKey) {
+					return;
+				}
+				event.preventDefault();
+				openTicket(link.getAttribute('data-hsw-ticket'));
+			});
+		}
+
+		/* --- reply ------------------------------------------------------ */
+
+		main.addEventListener('submit', function (event) {
+			var replyForm = event.target.closest('[data-hsw-reply-form]');
+			if (!replyForm) {
+				return;
+			}
+			event.preventDefault();
+
+			var textarea = replyForm.querySelector('textarea');
+			var button = replyForm.querySelector('.hsw-ac__composer-send');
+			var value = (textarea.value || '').trim();
+			if (!value) {
+				return;
+			}
+
+			var msg = chat.querySelector('[data-hsw-reply-msg]');
+			if (button) {
+				button.disabled = true;
+			}
+			if (msg) {
+				msg.textContent = '';
+			}
+
+			ajax(
+				'hsw_ticket_reply',
+				{ ticket_id: replyForm.getAttribute('data-ticket'), message: value },
+				data().ticketNonce
+			)
+				.then(function (response) {
+					if (button) {
+						button.disabled = false;
+					}
+					if (!response || !response.success) {
+						if (msg) {
+							msg.textContent = (response && response.data && response.data.message) || data().emailFailed;
+							msg.className = 'hsw-ac__composer-msg is-error';
+						}
+						return;
+					}
+					var box = chat.querySelector('[data-hsw-thread-scroll]');
+					if (box && response.data.html) {
+						box.insertAdjacentHTML('beforeend', response.data.html);
+					}
+					textarea.value = '';
+					autoGrow(textarea);
+					if (response.data.row) {
+						setRow(wrapRow(response.data.row, replyForm.getAttribute('data-ticket')));
+					}
+					scrollThread();
+				})
+				.catch(function () {
+					if (button) {
+						button.disabled = false;
+					}
+				});
+		});
+
+		function autoGrow(textarea) {
+			if (!textarea) {
+				return;
+			}
+			textarea.style.height = 'auto';
+			textarea.style.height = Math.min(160, textarea.scrollHeight) + 'px';
+		}
+
+		main.addEventListener('input', function (event) {
+			if (event.target.matches('[data-hsw-reply-form] textarea')) {
+				autoGrow(event.target);
+			}
+		});
+
+		/* --- close ------------------------------------------------------ */
+
+		main.addEventListener('click', function (event) {
+			var button = event.target.closest('[data-hsw-ticket-close]');
+			if (!button) {
+				return;
+			}
+			if (!window.confirm(data().closeConfirm || 'بسته شود؟')) {
+				return;
+			}
+			button.disabled = true;
+			ajax('hsw_ticket_close', { ticket_id: button.getAttribute('data-hsw-ticket-close') }, data().ticketNonce)
+				.then(function (response) {
+					if (response && response.success) {
+						main.innerHTML = response.data.html;
+						if (response.data.row) {
+							setRow(wrapRow(response.data.row, chat.getAttribute('data-active')));
+						}
+					} else {
+						button.disabled = false;
+					}
+				});
+		});
+
+		/* --- search ----------------------------------------------------- */
+
+		if (search && list) {
+			search.addEventListener('input', function () {
+				var term = search.value.trim().toLowerCase();
+				list.querySelectorAll('.hsw-ac__chat-item').forEach(function (item) {
+					item.hidden = term.length > 0 && item.textContent.toLowerCase().indexOf(term) === -1;
+				});
+			});
+		}
+
+		/* --- modal ------------------------------------------------------ */
+
+		function openModal() {
+			if (!modal) {
+				return;
+			}
+			modal.hidden = false;
+			requestAnimationFrame(function () {
+				modal.classList.add('is-open');
+			});
+			var first = modal.querySelector('#hsw-ac-t-subject');
+			if (first) {
+				first.focus();
+			}
+		}
+
+		function closeModal() {
+			if (!modal) {
+				return;
+			}
+			modal.classList.remove('is-open');
+			window.setTimeout(function () {
+				modal.hidden = true;
+			}, 200);
+		}
+
+		chat.addEventListener('click', function (event) {
+			if (event.target.closest('[data-hsw-ticket-new]')) {
+				event.preventDefault();
+				openModal();
+			}
+			if (event.target.closest('[data-hsw-modal-close]')) {
+				event.preventDefault();
+				closeModal();
+			}
+		});
+
+		document.addEventListener('keydown', function (event) {
+			if ('Escape' === event.key && modal && !modal.hidden) {
+				closeModal();
+			}
+		});
+
+		if (modal && '1' === modal.getAttribute('data-open')) {
+			openModal();
+		}
+
+		/* --- order picker ----------------------------------------------- */
+
+		var picker = modal ? modal.querySelector('[data-hsw-order-picker]') : null;
+		if (picker) {
+			var input = picker.querySelector('[data-hsw-order-input]');
+			var value = picker.querySelector('[data-hsw-order-value]');
+			var dropdown = picker.querySelector('[data-hsw-order-list]');
+			var timer = 0;
+
+			function renderOrders(orders) {
+				dropdown.innerHTML = '';
+				if (!orders || !orders.length) {
+					dropdown.innerHTML = '<p class="hsw-ac__picker-empty">' + (data().noOrders || 'موردی نیست') + '</p>';
+					dropdown.hidden = false;
+					return;
+				}
+				orders.forEach(function (order) {
+					var button = document.createElement('button');
+					button.type = 'button';
+					button.className = 'hsw-ac__picker-item';
+					button.textContent = order.label;
+					button.addEventListener('click', function () {
+						value.value = order.id;
+						input.value = order.label;
+						dropdown.hidden = true;
+					});
+					dropdown.appendChild(button);
+				});
+				dropdown.hidden = false;
+			}
+
+			function fetchOrders() {
+				ajax('hsw_orders_search', { term: input.value.trim() }, data().ticketNonce)
+					.then(function (response) {
+						if (response && response.success) {
+							renderOrders(response.data.orders);
+						}
+					});
+			}
+
+			input.addEventListener('focus', fetchOrders);
+			input.addEventListener('input', function () {
+				value.value = 0;
+				window.clearTimeout(timer);
+				timer = window.setTimeout(fetchOrders, 300);
+			});
+			input.addEventListener('blur', function () {
+				window.setTimeout(function () {
+					dropdown.hidden = true;
+				}, 180);
+			});
+		}
+
+		/* --- image: compress in the browser before it ever leaves ------- */
+
+		var fileInput = modal ? modal.querySelector('[data-hsw-image-input]') : null;
+		var preview = modal ? modal.querySelector('[data-hsw-image-preview]') : null;
+		var picked = null;
+
+		if (fileInput) {
+			fileInput.addEventListener('change', function () {
+				var file = fileInput.files && fileInput.files[0];
+				picked = null;
+				if (preview) {
+					preview.innerHTML = '';
+				}
+				if (!file) {
+					return;
+				}
+				compressImage(file, 1600, 0.82)
+					.then(function (blob) {
+						if (!blob) {
+							return;
+						}
+						picked = blob;
+						if (preview) {
+							preview.innerHTML = '';
+							var img = document.createElement('img');
+							img.src = URL.createObjectURL(blob);
+							img.alt = '';
+							preview.appendChild(img);
+						}
+					})
+					.catch(function () {});
+			});
+		}
+
+		/*
+		 * Canvas re-encode: a 4MB phone photo becomes ~200KB, which keeps the
+		 * upload inside PHP's limits and makes the thread load fast.
+		 */
+		function compressImage(file, maxSize, quality) {
+			return new Promise(function (resolve) {
+				if (!/^image\//.test(file.type)) {
+					resolve(null);
+					return;
+				}
+				var url = URL.createObjectURL(file);
+				var img = new Image();
+				img.onload = function () {
+					var scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+					var canvas = document.createElement('canvas');
+					canvas.width = Math.round(img.width * scale);
+					canvas.height = Math.round(img.height * scale);
+					var ctx = canvas.getContext('2d');
+					ctx.fillStyle = '#fff';
+					ctx.fillRect(0, 0, canvas.width, canvas.height);
+					ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+					URL.revokeObjectURL(url);
+					canvas.toBlob(function (blob) {
+						resolve(blob);
+					}, 'image/jpeg', quality);
+				};
+				img.onerror = function () {
+					URL.revokeObjectURL(url);
+					resolve(null);
+				};
+				img.src = url;
+			});
+		}
+
+		/* --- submit the modal ------------------------------------------- */
+
+		if (form) {
+			form.addEventListener('submit', function (event) {
+				event.preventDefault();
+
+				var msg = form.querySelector('[data-hsw-ticket-msg]');
+				var submit = form.querySelector('[data-hsw-ticket-submit]');
+				var subject = form.querySelector('[name="subject"]');
+				var message = form.querySelector('[name="message"]');
+
+				function showError(text) {
+					if (msg) {
+						msg.textContent = text;
+						msg.className = 'hsw-ac__modal-msg is-error';
+					}
+				}
+
+				if (!subject.value.trim() || !message.value.trim()) {
+					showError(data().ticketEmpty || 'موضوع و متن پیام را کامل کنید.');
+					return;
+				}
+
+				var body = new FormData(form);
+				body.append('action', 'hsw_ticket_create');
+				body.append('nonce', data().ticketNonce || '');
+				if (picked) {
+					body.append('image', picked, 'ticket.jpg');
+				} else {
+					body.delete('image');
+				}
+
+				if (submit) {
+					submit.disabled = true;
+				}
+				if (msg) {
+					msg.textContent = '';
+				}
+
+				fetch(data().ajax || '/wp-admin/admin-ajax.php', {
+					method: 'POST',
+					credentials: 'same-origin',
+					body: body
+				})
+					.then(function (response) {
+						return response.json();
+					})
+					.then(function (response) {
+						if (submit) {
+							submit.disabled = false;
+						}
+						if (!response || !response.success) {
+							showError((response && response.data && response.data.message) || data().emailFailed);
+							if (response && response.data && response.data.captcha) {
+								applyCaptcha(response.data.captcha);
+							}
+							return;
+						}
+
+						main.innerHTML = response.data.html;
+						if (response.data.row) {
+							setRow(wrapRow(response.data.row, response.data.ticket));
+						}
+						var count = chat.querySelector('[data-hsw-chat-count]');
+						if (count && list) {
+							count.textContent = faNum(list.querySelectorAll('[data-id]').length) + ' گفتگو';
+						}
+						chat.setAttribute('data-active', response.data.ticket);
+						form.reset();
+						picked = null;
+						if (preview) {
+							preview.innerHTML = '';
+						}
+						closeModal();
+						scrollThread();
+					})
+					.catch(function () {
+						if (submit) {
+							submit.disabled = false;
+						}
+						showError(data().emailFailed || 'خطا');
+					});
+			});
+		}
+
+		function applyCaptcha(captcha) {
+			if (!modal || !captcha) {
+				return;
+			}
+			var question = modal.querySelector('[data-hsw-captcha-q]');
+			var token = modal.querySelector('[data-hsw-captcha-token]');
+			var answer = modal.querySelector('[name="captcha"]');
+			var fa = function (n) {
+				return faNum(n);
+			};
+			if (question) {
+				question.textContent = fa(captcha.a) + ' + ' + fa(captcha.b) + ' = ?';
+			}
+			if (token) {
+				token.value = captcha.token;
+			}
+			if (answer) {
+				answer.value = '';
+			}
+		}
+
+		/* The server renders the newest ticket last; start at the bottom. */
+		scrollThread();
+	}
+
+	/*
+	 * Email confirmation banner for phone-first accounts.
+	 *
+	 * The whole flow is optional: without JS the banner still tells the customer
+	 * what to do and the account-details form still lets them change the address.
+	 * With JS it expands into a two-step code form that talks to admin-ajax.
+	 */
+	function initEmailVerify(box) {
+		if (!box || '1' === box.getAttribute('data-hsw-ready')) {
+			return;
+		}
+		box.setAttribute('data-hsw-ready', '1');
+
+		var openBtn = box.querySelector('[data-hsw-verify-open]');
+		var form = box.querySelector('[data-hsw-verify-form]');
+		var step = box.querySelector('[data-hsw-verify-step]');
+		var email = box.querySelector('[data-hsw-verify-email]');
+		var code = box.querySelector('[data-hsw-verify-code]');
+		var message = box.querySelector('[data-hsw-verify-msg]');
+		var sendBtn = box.querySelector('[data-hsw-verify-send]');
+		var confirmBtn = box.querySelector('[data-hsw-verify-confirm]');
+		var resendBtn = box.querySelector('[data-hsw-verify-resend]');
+
+		function busy(button, on) {
+			if (!button) {
+				return;
+			}
+			button.disabled = on;
+			button.classList.toggle('is-busy', on);
+		}
+
+		function send() {
+			var value = (email && email.value ? email.value : '').trim();
+			if (!value || value.indexOf('@') === -1) {
+				setMessage(message, data().emailInvalid || 'ایمیل معتبر وارد کنید.', 'error');
+				if (email) {
+					email.focus();
+				}
+				return;
+			}
+			busy(sendBtn, true);
+			setMessage(message, data().sending || 'در حال ارسال...', '');
+			ajax('hsw_email_send', { email: value }, data().emailNonce)
+				.then(function (response) {
+					busy(sendBtn, false);
+					if (!response || !response.success) {
+						setMessage(message, (response && response.data && response.data.message) || data().emailFailed, 'error');
+						return;
+					}
+					setMessage(message, (response.data && response.data.message) || data().emailSent, 'success');
+					if (step) {
+						step.hidden = false;
+					}
+					if (code) {
+						code.focus();
+					}
+				})
+				.catch(function () {
+					busy(sendBtn, false);
+					setMessage(message, data().emailFailed, 'error');
+				});
+		}
+
+		function confirm() {
+			var value = (code && code.value ? code.value : '').replace(/\D/g, '');
+			if (6 !== value.length) {
+				setMessage(message, data().codeRequired || 'کد تأیید را وارد کنید.', 'error');
+				return;
+			}
+			busy(confirmBtn, true);
+			ajax('hsw_email_verify', { code: value }, data().emailNonce)
+				.then(function (response) {
+					busy(confirmBtn, false);
+					if (!response || !response.success) {
+						setMessage(message, (response && response.data && response.data.message) || data().emailFailed, 'error');
+						return;
+					}
+					box.classList.add('is-done');
+					setMessage(message, (response.data && response.data.message) || data().emailDone, 'success');
+					/* Let the success state be readable, then drop the banner. */
+					window.setTimeout(function () {
+						box.hidden = true;
+					}, 2200);
+				})
+				.catch(function () {
+					busy(confirmBtn, false);
+					setMessage(message, data().emailFailed, 'error');
+				});
+		}
+
+		if (openBtn && form) {
+			openBtn.addEventListener('click', function () {
+				form.hidden = false;
+				openBtn.hidden = true;
+				if (email) {
+					email.focus();
+				}
+			});
+		}
+		if (sendBtn) {
+			sendBtn.addEventListener('click', send);
+		}
+		if (resendBtn) {
+			resendBtn.addEventListener('click', send);
+		}
+		if (confirmBtn) {
+			confirmBtn.addEventListener('click', confirm);
+		}
+		if (email) {
+			email.addEventListener('keydown', function (event) {
+				if ('Enter' === event.key) {
+					event.preventDefault();
+					send();
+				}
+			});
+		}
+		if (code) {
+			code.addEventListener('keydown', function (event) {
+				if ('Enter' === event.key) {
+					event.preventDefault();
+					confirm();
+				}
+			});
+		}
+	}
+
+	function switchAuth(tab) {
+		var auth = tab.closest('[data-hsw-auth]');
+		if (!auth) {
+			return;
+		}
+		var name = tab.getAttribute('data-hsw-auth-tab');
+		auth.setAttribute('data-active', name);
+		auth.querySelectorAll('[data-hsw-auth-tab]').forEach(function (button) {
+			var active = button === tab;
+			button.classList.toggle('is-active', active);
+			button.setAttribute('aria-selected', active ? 'true' : 'false');
+			button.setAttribute('tabindex', active ? '0' : '-1');
+		});
+		auth.querySelectorAll('[data-hsw-auth-panel]').forEach(function (panel) {
+			var active = panel.getAttribute('data-hsw-auth-panel') === name;
+			panel.classList.toggle('is-active', active);
+			panel.hidden = !active;
+		});
+		authHeading(auth, name);
+	}
+
+	/* The card heading follows the tab: one title, never a second one below. */
+	function authHeading(auth, mode) {
+		var head = auth.querySelector('.hsw-ac-auth__heading');
+		if (!head) {
+			return;
+		}
+		var isReg = 'register' === mode;
+		var title = head.getAttribute(isReg ? 'data-register-title' : 'data-login-title');
+		var sub = head.getAttribute(isReg ? 'data-register-sub' : 'data-login-sub');
+		var h1 = head.querySelector('h1');
+		var p = head.querySelector('p');
+		if (h1 && title) { h1.textContent = title; }
+		if (p && sub !== null) { p.textContent = sub; }
+	}
+
+	/* OTP ⇄ password inside one panel: exactly one form is visible. */
+	function authMode(panel, mode) {
+		panel.querySelectorAll('[data-hsw-auth-mode]').forEach(function (box) {
+			var on = box.getAttribute('data-hsw-auth-mode') === mode;
+			box.classList.toggle('is-active', on);
+			box.hidden = !on;
+		});
+	}
+
+	function switchMember(tab) {
+		var member = tab.closest('[data-hsw-member]');
+		if (!member) {
+			return;
+		}
+		var name = tab.getAttribute('data-hsw-member-tab');
+		member.querySelectorAll('[data-hsw-member-tab]').forEach(function (button) {
+			var active = button === tab;
+			button.classList.toggle('is-active', active);
+			button.setAttribute('aria-selected', active ? 'true' : 'false');
+		});
+		member.querySelectorAll('[data-hsw-member-panel]').forEach(function (panel) {
+			var active = panel.getAttribute('data-hsw-member-panel') === name;
+			panel.hidden = !active;
+		});
+	}
+
+	function togglePassword(button) {
+		var wrap = button.closest('.hsw-ac-input-wrap');
+		var input = wrap ? wrap.querySelector('input') : null;
+		if (!input) {
+			return;
+		}
+		var show = input.type === 'password';
+		input.type = show ? 'text' : 'password';
+		button.classList.toggle('is-visible', show);
+		button.setAttribute('aria-pressed', show ? 'true' : 'false');
+		button.setAttribute('aria-label', show ? (data().hidePassword || 'پنهان کردن رمز عبور') : (data().showPassword || 'نمایش رمز عبور'));
+	}
+
+	function ajax(action, payload, nonce) {
+		var body = new URLSearchParams();
+		body.append('action', action);
+		body.append('nonce', nonce || '');
+		Object.keys(payload || {}).forEach(function (key) {
+			body.append(key, payload[key] == null ? '' : payload[key]);
+		});
+		return fetch(data().ajax || '/wp-admin/admin-ajax.php', {
+			method: 'POST',
+			credentials: 'same-origin',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+			body: body.toString()
+		}).then(function (response) {
+			return response.json();
+		});
+	}
+
+	function setMessage(element, message, type, link, linkText) {
+		if (!element) {
+			return;
+		}
+		element.textContent = '';
+		element.classList.remove('is-error', 'is-success');
+		if (type) {
+			element.classList.add('is-' + type);
+		}
+		if (message) {
+			var text = document.createElement('span');
+			text.textContent = message;
+			element.appendChild(text);
+		}
+		if (link) {
+			var anchor = document.createElement('a');
+			anchor.href = link;
+			anchor.target = '_blank';
+			anchor.rel = 'noopener noreferrer';
+			anchor.textContent = linkText || (data().openLink || 'باز کردن لینک');
+			element.appendChild(document.createTextNode(' '));
+			element.appendChild(anchor);
+		}
+	}
+
+	function activeOtpChannel(box) {
+		var active = box.querySelector('[data-hsw-otp-channel].is-active');
+		return active ? active.getAttribute('data-hsw-otp-channel') : (box.getAttribute('data-channel') || '');
+	}
+
+	function otpField(box, channel) {
+		var isEmail = 'email' === channel;
+		var phoneField = box.querySelector('[data-hsw-otp-phone-field]');
+		var emailField = box.querySelector('[data-hsw-otp-email-field]');
+		if (phoneField) { setHidden(phoneField, isEmail); }
+		if (emailField) { setHidden(emailField, !isEmail); }
+		/* Register form: the account email *is* the recipient on this channel. */
+		var regWrap = box.querySelector('[data-hsw-otp-regemail-wrap]');
+		if (regWrap) { setHidden(regWrap, isEmail); }
+		return isEmail ? box.querySelector('[data-hsw-otp-emailid]') : box.querySelector('[data-hsw-otp-phone]');
+	}
+
+	function otpRedirect() {
+		try {
+			return new URLSearchParams(window.location.search).get('redirect_to') || '';
+		} catch (e) {
+			return '';
+		}
+	}
+
+	function initOtp(box) {
+		var channel = box.getAttribute('data-channel') || activeOtpChannel(box);
+		if (channel) { otpField(box, channel); }
+	}
+
+	document.addEventListener('DOMContentLoaded', function () {
+		document.querySelectorAll('[data-hsw-otp]').forEach(initOtp);
+	});
+
+	function setOtpChannel(box, channel) {
+		box.setAttribute('data-channel', channel);
+		box.querySelectorAll('[data-hsw-otp-channel]').forEach(function (button) {
+			var on = button.getAttribute('data-hsw-otp-channel') === channel;
+			button.classList.toggle('is-active', on);
+			button.setAttribute('aria-pressed', on ? 'true' : 'false');
+		});
+		var field = otpField(box, channel);
+		if (field) { field.focus({ preventScroll: true }); }
+		var step = box.querySelector('[data-hsw-otp-code-step]');
+		if (step) {
+			setHidden(step, true);
+		}
+		setMessage(box.querySelector('[data-hsw-otp-message]'), '');
+	}
+
+	function sendOtp(box) {
+		var button = box.querySelector('[data-hsw-otp-send]');
+		var message = box.querySelector('[data-hsw-otp-message]');
+		var channel = activeOtpChannel(box);
+		var context = box.getAttribute('data-context') || 'login';
+		var phone = otpField(box, channel);
+		var isEmail = 'email' === channel;
+		if (!phone || !phone.value.trim()) {
+			setMessage(message, isEmail ? 'ایمیل خود را وارد کنید.' : (data().phoneRequired || 'شماره موبایل را وارد کنید.'), 'error');
+			if (phone) {
+				phone.focus();
+			}
+			return;
+		}
+		if (isEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(phone.value.trim())) {
+			setMessage(message, 'ایمیل وارد‌شده معتبر نیست.', 'error');
+			phone.focus();
+			return;
+		}
+		if (!channel) {
+			setMessage(message, data().channelRequired || 'روش دریافت کد را انتخاب کنید.', 'error');
+			return;
+		}
+		if (button) {
+			button.disabled = true;
+		}
+		setMessage(message, data().sending || 'در حال ارسال کد...');
+		ajax('hsw_otp_send', { phone: phone.value.trim(), email: isEmail ? phone.value.trim() : '', channel: channel, context: context }, data().otpNonce)
+			.then(function (payload) {
+				if (!payload || !payload.success) {
+					var error = payload && payload.data ? payload.data : {};
+					setMessage(message, error.message || (data().sendError || 'ارسال کد ناموفق بود.'), 'error', error.link, error.link_text);
+					if (error.switch_tab) {
+						var authRoot = box.closest('[data-hsw-auth]');
+						var tabButton = authRoot ? authRoot.querySelector('[data-hsw-auth-tab="' + error.switch_tab + '"]') : null;
+						if (tabButton) {
+							tabButton.click();
+						}
+					}
+					return;
+				}
+				var step = box.querySelector('[data-hsw-otp-code-step]');
+				setHidden(step, false);
+				setMessage(message, payload.data.message || (data().sent || 'کد ارسال شد.'), 'success');
+				var code = box.querySelector('[data-hsw-otp-code]');
+				if (code) {
+					code.value = '';
+					code.focus();
+				}
+			})
+			.catch(function () {
+				setMessage(message, data().networkError || 'خطا در ارتباط با سرور. دوباره تلاش کنید.', 'error');
+			})
+			.finally(function () {
+				if (button) {
+					button.disabled = false;
+				}
+			});
+	}
+
+	function verifyOtp(box) {
+		var button = box.querySelector('[data-hsw-otp-verify]');
+		var message = box.querySelector('[data-hsw-otp-message]');
+		var channel = activeOtpChannel(box);
+		var phone = otpField(box, channel);
+		var code = box.querySelector('[data-hsw-otp-code]');
+		var name = box.querySelector('[data-hsw-otp-name]');
+		var email = box.querySelector('[data-hsw-otp-email]');
+		var context = box.getAttribute('data-context') || 'login';
+		if (!code || !code.value.trim()) {
+			setMessage(message, data().codeRequired || 'کد تأیید را وارد کنید.', 'error');
+			if (code) {
+				code.focus();
+			}
+			return;
+		}
+		if (button) {
+			button.disabled = true;
+		}
+		setMessage(message, data().verifying || 'در حال بررسی کد...');
+		ajax('hsw_otp_verify', {
+			phone: ('email' === channel) ? '' : (phone ? phone.value.trim() : ''),
+			email: ('email' === channel) ? (phone ? phone.value.trim() : '') : (email ? email.value.trim() : ''),
+			channel: channel,
+			context: context,
+			code: code.value.trim(),
+			name: name ? name.value.trim() : '',
+			redirect_to: otpRedirect()
+		}, data().otpNonce)
+			.then(function (payload) {
+				if (!payload || !payload.success) {
+					var error = payload && payload.data ? payload.data : {};
+					setMessage(message, error.message || (data().verifyError || 'کد تأیید نامعتبر است.'), 'error');
+					if (error.switch_tab) {
+						var authRoot = box.closest('[data-hsw-auth]');
+						var tabButton = authRoot ? authRoot.querySelector('[data-hsw-auth-tab="' + error.switch_tab + '"]') : null;
+						if (tabButton) {
+							tabButton.click();
+						}
+					}
+					return;
+				}
+				setMessage(message, payload.data.message || (data().verified || 'تأیید شد.'), 'success');
+				window.location.href = payload.data.redirect || window.location.href;
+			})
+			.catch(function () {
+				setMessage(message, data().networkError || 'خطا در ارتباط با سرور. دوباره تلاش کنید.', 'error');
+			})
+			.finally(function () {
+				if (button) {
+					button.disabled = false;
+				}
+			});
+	}
+
+	function send2faSetup(panel) {
+		var button = panel.querySelector('[data-hsw-2fa-setup]');
+		var message = panel.querySelector('[data-hsw-2fa-message]');
+		var active = panel.querySelector('[data-hsw-2fa-channel].is-active');
+		var channel = active ? active.getAttribute('data-hsw-2fa-channel') : '';
+		if (!channel) {
+			setMessage(message, data().channelRequired || 'روش دریافت کد را انتخاب کنید.', 'error');
+			return;
+		}
+		if (button) {
+			button.disabled = true;
+		}
+		var phoneInput = panel.querySelector('[data-hsw-2fa-phone]');
+		var payload = { channel: channel };
+		if (phoneInput && phoneInput.value.trim()) {
+			payload.phone = phoneInput.value.trim();
+		}
+		setMessage(message, data().sending || 'در حال ارسال کد...');
+		ajax('hsw_2fa_setup_send', payload, data().twoFactorNonce)
+			.then(function (payload) {
+				if (!payload || !payload.success) {
+					var error = payload && payload.data ? payload.data : {};
+					setMessage(message, error.message || (data().sendError || 'ارسال کد ناموفق بود.'), 'error', error.link, error.link_text);
+					return;
+				}
+				var step = panel.querySelector('[data-hsw-2fa-code-step]');
+				setHidden(step, false);
+				setMessage(message, payload.data.message || (data().sent || 'کد ارسال شد.'), 'success');
+				var code = panel.querySelector('[data-hsw-2fa-code]');
+				if (code) {
+					code.value = '';
+					code.focus();
+				}
+			})
+			.catch(function () {
+				setMessage(message, data().networkError || 'خطا در ارتباط با سرور. دوباره تلاش کنید.', 'error');
+			})
+			.finally(function () {
+				if (button) {
+					button.disabled = false;
+				}
+			});
+	}
+
+	function verify2faSetup(panel) {
+		var message = panel.querySelector('[data-hsw-2fa-message]');
+		var code = panel.querySelector('[data-hsw-2fa-code]');
+		if (!code || !code.value.trim()) {
+			setMessage(message, data().codeRequired || 'کد تأیید را وارد کنید.', 'error');
+			return;
+		}
+		ajax('hsw_2fa_setup_verify', { code: code.value.trim() }, data().twoFactorNonce)
+			.then(function (payload) {
+				if (!payload || !payload.success) {
+					var error = payload && payload.data ? payload.data : {};
+					setMessage(message, error.message || (data().verifyError || 'کد تأیید نامعتبر است.'), 'error');
+					return;
+				}
+				setMessage(message, payload.data.message || (data().verified || 'تأیید شد.'), 'success');
+				window.setTimeout(function () {
+					window.location.reload();
+				}, 500);
+			})
+			.catch(function () {
+				setMessage(message, data().networkError || 'خطا در ارتباط با سرور. دوباره تلاش کنید.', 'error');
+			});
+	}
+
+	function verify2faChallenge(challenge) {
+		var message = challenge.querySelector('[data-hsw-2fa-message]');
+		var code = challenge.querySelector('[data-hsw-2fa-code]');
+		var token = challenge.getAttribute('data-token');
+		if (!code || !code.value.trim()) {
+			setMessage(message, data().codeRequired || 'کد تأیید را وارد کنید.', 'error');
+			return;
+		}
+		ajax('hsw_2fa_verify', { token: token, code: code.value.trim() }, data().twoFactorNonce)
+			.then(function (payload) {
+				if (!payload || !payload.success) {
+					var error = payload && payload.data ? payload.data : {};
+					setMessage(message, error.message || (data().verifyError || 'کد تأیید نامعتبر است.'), 'error');
+					return;
+				}
+				setMessage(message, payload.data.message || (data().verified || 'تأیید شد.'), 'success');
+				window.location.href = payload.data.redirect || window.location.href;
+			})
+			.catch(function () {
+				setMessage(message, data().networkError || 'خطا در ارتباط با سرور. دوباره تلاش کنید.', 'error');
+			});
+	}
+
+	function resend2faChallenge(challenge) {
+		var message = challenge.querySelector('[data-hsw-2fa-message]');
+		ajax('hsw_2fa_resend', { token: challenge.getAttribute('data-token') }, data().twoFactorNonce)
+			.then(function (payload) {
+				if (!payload || !payload.success) {
+					var error = payload && payload.data ? payload.data : {};
+					setMessage(message, error.message || (data().sendError || 'ارسال کد ناموفق بود.'), 'error');
+					return;
+				}
+				setMessage(message, payload.data.message || (data().sent || 'کد ارسال شد.'), 'success');
+			})
+			.catch(function () {
+				setMessage(message, data().networkError || 'خطا در ارتباط با سرور. دوباره تلاش کنید.', 'error');
+			});
+	}
+
+	function removeWish(id, button) {
+		var list = wishList().filter(function (item) {
+			return String(item) !== String(id);
+		});
+		saveWish(list);
+		var card = button ? button.closest('.hsw-ac__wish') : null;
+		if (card) {
+			card.remove();
+		}
+		updateCounts();
+		var page = document.querySelector('[data-hsw-wishlist]');
+		if (page && !list.length) {
+			wishlistEmpty(page);
+		}
+	}
+
+	document.addEventListener('click', function (event) {
+		var faChannel = event.target.closest('[data-hsw-2fa-channel]');
+		if (faChannel) {
+			var faBox = faChannel.closest('[data-hsw-2fa]');
+			if (faBox) {
+				var ch = faChannel.getAttribute('data-hsw-2fa-channel');
+				var wrap = faBox.querySelector('[data-hsw-2fa-phone-wrap]');
+				if (wrap) { setHidden(wrap, 'sms' !== ch); }
+			}
+		}
+
+		var otpChannel = event.target.closest('[data-hsw-otp-channel]');
+		if (otpChannel) {
+			event.preventDefault();
+			var otpBox = otpChannel.closest('[data-hsw-otp]');
+			if (otpBox) {
+				setOtpChannel(otpBox, otpChannel.getAttribute('data-hsw-otp-channel'));
+			}
+			return;
+		}
+
+		var otpSend = event.target.closest('[data-hsw-otp-send]');
+		if (otpSend) {
+			event.preventDefault();
+			var sendBox = otpSend.closest('[data-hsw-otp]');
+			if (sendBox) {
+				sendOtp(sendBox);
+			}
+			return;
+		}
+
+		var otpResend = event.target.closest('[data-hsw-otp-resend]');
+		if (otpResend) {
+			event.preventDefault();
+			var resendBox = otpResend.closest('[data-hsw-otp]');
+			if (resendBox) {
+				sendOtp(resendBox);
+			}
+			return;
+		}
+
+		var otpVerify = event.target.closest('[data-hsw-otp-verify]');
+		if (otpVerify) {
+			event.preventDefault();
+			var verifyBox = otpVerify.closest('[data-hsw-otp]');
+			if (verifyBox) {
+				verifyOtp(verifyBox);
+			}
+			return;
+		}
+
+		var challengeVerify = event.target.closest('[data-hsw-2fa-challenge] [data-hsw-2fa-verify]');
+		if (challengeVerify) {
+			event.preventDefault();
+			verify2faChallenge(challengeVerify.closest('[data-hsw-2fa-challenge]'));
+			return;
+		}
+
+		var challengeResend = event.target.closest('[data-hsw-2fa-challenge] [data-hsw-2fa-resend]');
+		if (challengeResend) {
+			event.preventDefault();
+			resend2faChallenge(challengeResend.closest('[data-hsw-2fa-challenge]'));
+			return;
+		}
+
+		var setupChannel = event.target.closest('[data-hsw-2fa-channel]');
+		if (setupChannel) {
+			event.preventDefault();
+			var setupPanel = setupChannel.closest('[data-hsw-2fa]');
+			var setupChannelName = setupChannel.getAttribute('data-hsw-2fa-channel');
+			if (setupPanel) {
+				setupPanel.setAttribute('data-channel', setupChannelName);
+				setupPanel.querySelectorAll('[data-hsw-2fa-channel]').forEach(function (button) {
+					var on = button.getAttribute('data-hsw-2fa-channel') === setupChannelName;
+					button.classList.toggle('is-active', on);
+					button.setAttribute('aria-pressed', on ? 'true' : 'false');
+				});
+				setHidden(setupPanel.querySelector('[data-hsw-2fa-code-step]'), true);
+				setMessage(setupPanel.querySelector('[data-hsw-2fa-message]'), '');
+			}
+			return;
+		}
+
+		var setupSend = event.target.closest('[data-hsw-2fa-setup]');
+		if (setupSend) {
+			event.preventDefault();
+			var setupBox = setupSend.closest('[data-hsw-2fa]');
+			if (setupBox) {
+				send2faSetup(setupBox);
+			}
+			return;
+		}
+
+		var setupResend = event.target.closest('[data-hsw-2fa-setup-resend]');
+		if (setupResend) {
+			event.preventDefault();
+			var resendPanel = setupResend.closest('[data-hsw-2fa]');
+			if (resendPanel) {
+				send2faSetup(resendPanel);
+			}
+			return;
+		}
+
+		var setupVerify = event.target.closest('[data-hsw-2fa-setup-verify], [data-hsw-2fa] [data-hsw-2fa-verify]');
+		if (setupVerify) {
+			event.preventDefault();
+			verify2faSetup(setupVerify.closest('[data-hsw-2fa]'));
+			return;
+		}
+
+		var setupDisable = event.target.closest('[data-hsw-2fa-disable]');
+		if (setupDisable) {
+			event.preventDefault();
+			var disablePanel = setupDisable.closest('[data-hsw-2fa]');
+			if (disablePanel) {
+				var disableMessage = disablePanel.querySelector('[data-hsw-2fa-message]');
+				ajax('hsw_2fa_disable', {}, data().twoFactorNonce)
+					.then(function (payload) {
+						if (!payload || !payload.success) {
+							setMessage(disableMessage, payload && payload.data ? payload.data.message : (data().verifyError || 'عملیات ناموفق بود.'), 'error');
+							return;
+						}
+						setMessage(disableMessage, payload.data.message, 'success');
+						window.location.reload();
+					})
+					.catch(function () {
+						setMessage(disableMessage, data().networkError || 'خطا در ارتباط با سرور.', 'error');
+					});
+			}
+			return;
+		}
+
+		var modeSwitch = event.target.closest('[data-hsw-auth-mode-switch]');
+		if (modeSwitch) {
+			event.preventDefault();
+			var panel = modeSwitch.closest('[data-hsw-auth-panel]');
+			if (panel) {
+				authMode(panel, modeSwitch.getAttribute('data-hsw-auth-mode-switch'));
+			}
+			return;
+		}
+
+		var authTab = event.target.closest('[data-hsw-auth-tab]');
+		if (authTab) {
+			event.preventDefault();
+			switchAuth(authTab);
+			return;
+		}
+
+		var memberTab = event.target.closest('[data-hsw-member-tab]');
+		if (memberTab) {
+			event.preventDefault();
+			switchMember(memberTab);
+			return;
+		}
+
+		var passwordToggle = event.target.closest('[data-hsw-pass-toggle]');
+		if (passwordToggle) {
+			event.preventDefault();
+			togglePassword(passwordToggle);
+			return;
+		}
+
+		var remove = event.target.closest('[data-hsw-wish-remove]');
+		if (remove) {
+			event.preventDefault();
+			removeWish(remove.getAttribute('data-hsw-wish-remove'), remove);
+			return;
+		}
+
+		var clear = event.target.closest('[data-hsw-wish-clear]');
+		if (clear) {
+			event.preventDefault();
+			if (window.confirm(data().clearConfirm || 'همهٔ محصولات از علاقه‌مندی‌ها حذف شوند؟')) {
+				saveWish([]);
+				updateCounts();
+				var page = clear.closest('[data-hsw-wishlist]');
+				if (page) {
+					wishlistEmpty(page);
+				}
+			}
+			return;
+		}
+
+		document.querySelectorAll('.hsw-ac__bell[open]').forEach(function (bell) {
+			if (!bell.contains(event.target)) {
+				bell.removeAttribute('open');
+			}
+		});
+	});
+
+	/*
+	 * Fallback for browsers without :has(): the hero has to stop clipping while
+	 * the bell dropdown is open, otherwise the panel is cut off at the hero edge.
+	 */
+	document.querySelectorAll('.hsw-ac__bell').forEach(function (bell) {
+		var hero = bell.closest('.hsw-ac__hero');
+		if (!hero) {
+			return;
+		}
+		var sync = function () {
+			hero.classList.toggle('is-bell-open', bell.hasAttribute('open'));
+		};
+		bell.addEventListener('toggle', sync);
+		sync();
+	});
+
+	document.addEventListener('keydown', function (event) {
+		if ('Escape' === event.key) {
+			document.querySelectorAll('.hsw-ac__bell[open]').forEach(function (bell) {
+				bell.removeAttribute('open');
+				var summary = bell.querySelector('summary');
+				if (summary) {
+					summary.focus();
+				}
+			});
+		}
+	});
+
+	window.addEventListener('storage', function (event) {
+		if (event.key && event.key !== WISH_KEY) {
+			return;
+		}
+		updateCounts();
+		var page = document.querySelector('[data-hsw-wishlist]');
+		if (page) {
+			page.removeAttribute('data-hsw-ready');
+			renderWishlist(page);
+		}
+	});
+
+	function boot() {
+		init(document);
+		if (window.elementorFrontend && window.elementorFrontend.hooks) {
+			window.elementorFrontend.hooks.addAction('frontend/element_ready/global', function () {
+				init(document);
+			});
+		}
+	}
+
+	/* ---------------------------------------------------------------------------
+ * Wallet: top-up request and points conversion
+ * ------------------------------------------------------------------------ */
+(function () {
+	function toLatin(value) {
+		return String(value)
+			.replace(/[\u06F0-\u06F9]/g, function (d) { return String(d.charCodeAt(0) - 0x06F0); })
+			.replace(/[\u0660-\u0669]/g, function (d) { return String(d.charCodeAt(0) - 0x0660); })
+			.replace(/[^\d]/g, '');
+	}
+
+	function say(form, text, tone) {
+		var msg = form.querySelector('[data-hsw-wallet-msg]');
+		if (!msg) { return; }
+		msg.textContent = text || '';
+		msg.hidden = !text;
+		msg.classList.toggle('is-error', tone === 'error');
+		msg.classList.toggle('is-ok', tone === 'ok');
+	}
+
+	function submit(form, path, payload, reload) {
+		var cfg = data();
+		if (!cfg.rest) { return; }
+
+		var btn = form.querySelector('button[type="submit"]');
+		if (btn) { btn.disabled = true; }
+
+		fetch(cfg.rest + path, {
+			method: 'POST',
+			credentials: 'same-origin',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-WP-Nonce': cfg.nonce || ''
+			},
+			body: JSON.stringify(payload)
+		})
+			.then(function (response) { return response.json(); })
+			.then(function (json) {
+				if (!json || !json.ok) {
+					throw new Error((json && json.message) || 'failed');
+				}
+				say(form, json.message, 'ok');
+				if (reload) {
+					window.location.reload();
+				}
+			})
+			.catch(function (err) {
+				if (btn) { btn.disabled = false; }
+				say(form, (err && err.message) ? err.message : (cfg.errorText || 'انجام نشد.'), 'error');
+			});
+	}
+
+	document.addEventListener('submit', function (event) {
+		var form = event.target;
+		if (!form || !form.matches) { return; }
+
+		if (form.matches('[data-hsw-wallet-pay]')) {
+			event.preventDefault();
+			var amountField = form.querySelector('[name="amount"]');
+			var gatewayField = form.querySelector('[name="gateway"]');
+			var payload = { amount: toLatin(amountField ? amountField.value : '') };
+			if (gatewayField) { payload.gateway = gatewayField.value; }
+
+			var payBtn = form.querySelector('button[type="submit"]');
+			if (payBtn) { payBtn.disabled = true; }
+			var cfg0 = data();
+			fetch(cfg0.rest + '/account/wallet/pay', {
+				method: 'POST',
+				credentials: 'same-origin',
+				headers: { 'Content-Type': 'application/json', 'X-WP-Nonce': cfg0.nonce || '' },
+				body: JSON.stringify(payload)
+			})
+				.then(function (r) { return r.json(); })
+				.then(function (json) {
+					if (!json || !json.ok || !json.redirect) {
+						throw new Error((json && json.message) || 'failed');
+					}
+					say(form, json.message || 'در حال انتقال…', 'ok');
+					window.location.href = json.redirect;
+				})
+				.catch(function (err) {
+					if (payBtn) { payBtn.disabled = false; }
+					say(form, (err && err.message) ? err.message : 'شارژ انجام نشد.', 'error');
+				});
+			return;
+		}
+
+		if (form.matches('[data-hsw-wallet-topup]')) {
+			event.preventDefault();
+			var amount = form.querySelector('[name="amount"]');
+			var note = form.querySelector('[name="note"]');
+			submit(form, '/account/wallet/topup', {
+				amount: toLatin(amount ? amount.value : ''),
+				note: note ? note.value : ''
+			}, false);
+			return;
+		}
+
+		if (form.matches('[data-hsw-wallet-convert]')) {
+			event.preventDefault();
+			var points = form.querySelector('[name="points"]');
+			submit(form, '/account/wallet/convert', {
+				points: toLatin(points ? points.value : '')
+			}, true);
+		}
+	});
+})();
+
+/* ---------------------------------------------------------------------------
+ * Notifications: "خواندن همه"
+ *
+ * The whole list lives in one user-meta row, so this is a single write. The
+ * DOM is patched in place rather than reloading the page.
+ * ------------------------------------------------------------------------ */
+document.addEventListener('click', function (event) {
+	var btn = event.target.closest ? event.target.closest('[data-hsw-readall]') : null;
+	if (!btn || btn.disabled) {
+		return;
+	}
+	var cfg = data();
+	if (!cfg.rest) {
+		return;
+	}
+
+	btn.disabled = true;
+
+	fetch(cfg.rest + '/account/notifications/read', {
+		method: 'POST',
+		credentials: 'same-origin',
+		headers: {
+			'Content-Type': 'application/json',
+			'X-WP-Nonce': cfg.nonce || ''
+		}
+	})
+		.then(function (response) {
+			return response.json();
+		})
+		.then(function (json) {
+			if (!json || !json.ok) {
+				throw new Error('failed');
+			}
+
+			document.querySelectorAll('.hsw-ac__notif.is-unread').forEach(function (el) {
+				el.classList.remove('is-unread');
+			});
+			document.querySelectorAll('.hsw-ac__unread-dot').forEach(function (el) {
+				el.remove();
+			});
+
+			var pill = document.querySelector('[data-hsw-unread-pill]');
+			if (pill) {
+				pill.remove();
+			}
+
+			/* Sidebar badge on the notifications item. */
+			document.querySelectorAll('.hsw-ac__menu a[href*="/notifications"]').forEach(function (link) {
+				var badge = link.querySelector('.hsw-ac__badge');
+				if (badge) {
+					badge.remove();
+				}
+			});
+
+			btn.remove();
+		})
+		.catch(function () {
+			btn.disabled = false;
+		});
+});
+
+/* ---------------------------------------------------------------------------
+ * Invoice printing
+ *
+ * A delegated listener rather than a per-widget init: the invoice markup is
+ * printed server-side on the view-order endpoint, which the account widget
+ * does not re-render on navigation.
+ * ------------------------------------------------------------------------ */
+document.addEventListener('click', function (event) {
+	var btn = event.target.closest ? event.target.closest('[data-hsw-print]') : null;
+	if (!btn) {
+		return;
+	}
+	event.preventDefault();
+	document.body.classList.add('hsw-printing');
+	window.print();
+});
+
+/* Some browsers keep the class after the dialog closes; clean it up. */
+window.addEventListener('afterprint', function () {
+	document.body.classList.remove('hsw-printing');
+});
+
+if ('loading' === document.readyState) {
+		document.addEventListener('DOMContentLoaded', boot);
+	} else {
+		boot();
+	}
+})();
+
+/* ---------------------------------------------------------------- drawer */
+(function () {
+	var btn = document.querySelector('[data-hsw-ac-menu]');
+	var side = document.querySelector('.hsw-ac__side');
+	if (!btn || !side) { return; }
+
+	var scrim = document.createElement('div');
+	scrim.className = 'hsw-ac__scrim';
+	document.body.appendChild(scrim);
+
+	function set(open) {
+		side.classList.toggle('is-open', open);
+		scrim.classList.toggle('is-on', open);
+		btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+		document.documentElement.classList.toggle('hsw-ac-lock', open);
+	}
+
+	btn.addEventListener('click', function () {
+		set(!side.classList.contains('is-open'));
+	});
+	scrim.addEventListener('click', function () { set(false); });
+	document.addEventListener('keydown', function (e) {
+		if ('Escape' === e.key) { set(false); }
+	});
+	side.addEventListener('click', function (e) {
+		if (e.target.closest('a')) { set(false); }
+	});
+})();
